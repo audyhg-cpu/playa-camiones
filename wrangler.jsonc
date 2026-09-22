@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "playa-camiones",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-22",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "playa-camiones-db",
+      "database_id": "2a31649f-c9f4-42ef-991e-b9255dddb679"
+    }
+  ]
+}
