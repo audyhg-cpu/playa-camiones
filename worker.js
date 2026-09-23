@@ -35,6 +35,9 @@ async function init(env) {
     if (!filasCols.results.some(c => c.name === 'producto_vence_en')) {
       await D.prepare('ALTER TABLE filas ADD COLUMN producto_vence_en INTEGER').run();
     }
+    if (!filasCols.results.some(c => c.name === 'activada_en')) {
+      await D.prepare('ALTER TABLE filas ADD COLUMN activada_en INTEGER').run();
+    }
 
     for (const p of ['Vacío','Soja','Maíz','Girasol','Trigo','Camelina']) {
       await D.prepare('INSERT OR IGNORE INTO productos(nombre) VALUES(?)').bind(p).run();
@@ -56,10 +59,10 @@ async function init(env) {
 }
 
 async function state(D) {
-  await D.prepare("UPDATE filas SET producto='Vacío', producto_vence_en=NULL WHERE sector='post' AND producto<>'Vacío' AND producto_vence_en IS NOT NULL AND producto_vence_en<=unixepoch() AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1)").run();
+  await D.prepare("UPDATE filas SET producto='Vacío', producto_vence_en=NULL, activada_en=NULL WHERE sector='post' AND producto<>'Vacío' AND producto_vence_en IS NOT NULL AND producto_vence_en<=unixepoch() AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1)").run();
   const [p, f, l] = await Promise.all([
     D.prepare("SELECT nombre FROM productos ORDER BY CASE WHEN nombre='Vacío' THEN 0 ELSE 1 END, nombre COLLATE NOCASE").all(),
-    D.prepare('SELECT fila,sector,producto,sentido FROM filas ORDER BY fila').all(),
+    D.prepare('SELECT fila,sector,producto,sentido,activada_en FROM filas ORDER BY fila').all(),
     D.prepare('SELECT fila,posicion,ocupado,bloqueado FROM lugares ORDER BY fila,posicion').all()
   ]);
 
@@ -118,10 +121,10 @@ $('tp').onclick=()=>tabs('pre');$('to').onclick=()=>tabs('post');
 function opts(v){return S.productos.map(x=>'<option '+(x===v?'selected':'')+'>'+x+'</option>').join('')}
 function sel(f){const s=document.createElement('select');s.className='sel';s.innerHTML=opts(S.filas[f]?.producto||'Vacío');const pausa=()=>{pauseUntil=Date.now()+30000};s.onpointerdown=pausa;s.ontouchstart=pausa;s.onfocus=pausa;s.onchange=async()=>{try{await api('/api/fila',{method:'POST',body:JSON.stringify({fila:f,producto:s.value,operador:who()})});pauseUntil=0;setTimeout(()=>load(),400)}catch(e){pauseUntil=0;toast(e.message)}};s.onblur=()=>{pauseUntil=0;setTimeout(()=>load(),400)};return s}
 function dir(f){const b=document.createElement('button');b.className='dir';b.textContent=S.filas[f]?.sentido==='izquierda'?'←':'→';b.onclick=async()=>{try{await api('/api/fila',{method:'POST',body:JSON.stringify({fila:f,sentido:S.filas[f]?.sentido==='izquierda'?'derecha':'izquierda',operador:who()})});load()}catch(e){toast(e.message)}};return b}
-function nextPlace(){for(let f=16;f<=32;f++){const sentido=S.filas[f]?.sentido==='izquierda'?'izquierda':'derecha';const orden=sentido==='izquierda'?[5,4,3,2,1]:[1,2,3,4,5];for(const p of orden){const x=S.lugares[f]?.[p]||{};if(!x.ocupado&&!x.bloqueado)return{fila:f,pos:p,producto:S.filas[f]?.producto||'Vacío'}}}return null}
-function updateGuide(){const n=nextPlace();$('guide').textContent=n?'Próximo lugar: Fila '+n.fila+' · Lugar '+n.pos+' · '+n.producto:'Sin lugares disponibles'}
+function nextPlace(){const filas=[];for(let f=16;f<=32;f++)if(S.filas[f]?.producto&&S.filas[f].producto!=='Vacío')filas.push(f);filas.sort((a,b)=>(S.filas[b]?.activada_en||0)-(S.filas[a]?.activada_en||0)||a-b);for(const f of filas){const sentido=S.filas[f]?.sentido==='izquierda'?'izquierda':'derecha';const orden=sentido==='izquierda'?[5,4,3,2,1]:[1,2,3,4,5];for(const p of orden){const x=S.lugares[f]?.[p]||{};if(!x.ocupado&&!x.bloqueado)return{fila:f,pos:p,producto:S.filas[f].producto}}return null}
+function updateGuide(){const n=nextPlace(),habilitada=Object.values(S.filas).some(x=>x.sector==='post'&&x.producto&&x.producto!=='Vacío');$('guide').textContent=n?'Próximo lugar: Fila '+n.fila+' · Lugar '+n.pos+' · '+n.producto:(habilitada?'Sin lugares disponibles':'Sin fila habilitada')}
 function render(){$('pr').innerHTML='';for(let f=1;f<=12;f++){const r=document.createElement('div'),n=document.createElement('div'),habilitada=S.filas[f]?.producto!=='Vacío';r.className='row pre '+(habilitada?'enabled':'disabled');n.className='num';n.textContent=f;r.append(n,sel(f),dir(f));$('pr').append(r)}$('po').innerHTML='';let u=0;for(let f=16;f<=32;f++){const r=document.createElement('div'),n=document.createElement('div');n.className='num';n.textContent=f;r.append(n,sel(f),dir(f));let bloqueados=0,ocupados=0;for(let p=1;p<=5;p++){const x=S.lugares[f]?.[p]||{},on=!!x.ocupado,bl=!!x.bloqueado;if(on){u++;ocupados++}if(bl)bloqueados++;const b=document.createElement('button');b.className='slot'+(on?' on':'')+(bl?' blocked':'');b.textContent=on?'●':bl?'×':'·';b.disabled=bl&&!on;b.onclick=()=>slot(f,p,on,bl);r.append(b)}const estado=ocupados===5?'full':(ocupados===0&&S.filas[f]?.producto==='Vacío'?'empty':'loading');r.className='row post '+estado;const a=document.createElement('div');a.className='actions';const c=document.createElement('button');c.className='act '+(bloqueados?'open':'cut');c.textContent=bloqueados?'Reabrir':'Cortar';c.onclick=()=>corte(f,!!bloqueados);const v=document.createElement('button');v.className='act';v.textContent='Vaciar';v.onclick=()=>clearRow(f);a.append(c,v);r.append(a);$('po').append(r)}$('used').textContent=u;updateGuide();tabs(tab)}
-async function slot(f,p,on,bl){if(bl&&!on)return;try{const j=await api('/api/lugar',{method:'POST',body:JSON.stringify({fila:f,posicion:p,ocupar:!on,operador:who()})});toast(j.message);load()}catch(e){toast(e.message);load()}}
+async function slot(f,p,on,bl){if(bl&&!on)return;if(!on&&(!S.filas[f]?.producto||S.filas[f].producto==='Vacío'))return toast('Primero seleccioná un producto');try{const j=await api('/api/lugar',{method:'POST',body:JSON.stringify({fila:f,posicion:p,ocupar:!on,operador:who()})});toast(j.message);load()}catch(e){toast(e.message);load()}}
 async function corte(f,reabrir){try{const j=await api('/api/corte',{method:'POST',body:JSON.stringify({fila:f,reabrir,operador:who()})});toast(reabrir?j.message:'CORTE — CAMBIAR DE FILA');if(!reabrir)alert('CORTE — CAMBIAR DE FILA');load()}catch(e){toast(e.message)}}
 async function clearRow(f){let c=0;for(let p=1;p<=5;p++)if(S.lugares[f]?.[p]?.ocupado)c++;if(c&&!confirm('¿Vaciar fila '+f+'?'))return;try{const j=await api('/api/vaciar',{method:'POST',body:JSON.stringify({fila:f,operador:who()})});toast(j.message);load()}catch(e){toast(e.message)}}
 async function load(){if(busy||Date.now()<pauseUntil)return;busy=true;try{const d=await api('/api/state');Object.assign(S,d);render();$('st').textContent='Sincronizado · actualiza cada 2 s'}catch(e){$('st').textContent=e.message}finally{busy=false}}
@@ -152,7 +155,7 @@ export default {
         const f = +b.fila;
         if (b.producto !== undefined) {
           const producto=String(b.producto);
-          await D.prepare("UPDATE filas SET producto=?, producto_vence_en=CASE WHEN sector='post' AND ?<>'Vacío' AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1) THEN unixepoch()+600 ELSE NULL END WHERE fila=?").bind(producto,producto,f).run();
+          await D.prepare("UPDATE filas SET producto=?, producto_vence_en=CASE WHEN sector='post' AND ?<>'Vacío' AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1) THEN unixepoch()+600 ELSE NULL END, activada_en=CASE WHEN sector='post' AND ?<>'Vacío' THEN unixepoch() ELSE NULL END WHERE fila=?").bind(producto,producto,producto,f).run();
         }
         if (b.sentido !== undefined) await D.prepare('UPDATE filas SET sentido=? WHERE fila=?').bind(String(b.sentido),f).run();
         return J({ok:true});
@@ -171,6 +174,8 @@ export default {
 
       if (u.pathname === '/api/lugar' && req.method === 'POST') {
         const f=+b.fila,p=+b.posicion,o=String(b.operador||'Sin nombre').slice(0,40),q=b.ocupar?1:0,old=q?0:1;
+        const filaActual = await D.prepare('SELECT producto FROM filas WHERE fila=?').bind(f).first();
+        if (q && (!filaActual?.producto || filaActual.producto === 'Vacío')) return J({error:'Primero seleccioná un producto'},409);
         const block = await D.prepare('SELECT bloqueado FROM lugares WHERE fila=? AND posicion=?').bind(f,p).first();
         if (q && block?.bloqueado) return J({error:'Ese lugar está bloqueado por cruce'},409);
         const r=await D.prepare('UPDATE lugares SET ocupado=?,operador=? WHERE fila=? AND posicion=? AND ocupado=?').bind(q,o,f,p,old).run();
@@ -199,7 +204,7 @@ export default {
         const f=+b.fila,o=String(b.operador||'Sin nombre').slice(0,40);
         const c=await D.prepare('SELECT COUNT(*) c FROM lugares WHERE fila=? AND ocupado=1').bind(f).first();
         await D.prepare('UPDATE lugares SET ocupado=0,operador=? WHERE fila=?').bind(o,f).run();
-        await D.prepare("UPDATE filas SET producto='Vacío',producto_vence_en=NULL WHERE fila=?").bind(f).run();
+        await D.prepare("UPDATE filas SET producto='Vacío',producto_vence_en=NULL,activada_en=NULL WHERE fila=?").bind(f).run();
         if(!c?.c)return J({ok:true,message:'Fila '+f+' marcada como vacía'});
         await D.prepare("INSERT INTO movimientos(fila,posicion,accion,operador) VALUES(?,NULL,'VACIAR_FILA',?)").bind(f,o).run();
         return J({ok:true,message:'Fila '+f+' vaciada'});
