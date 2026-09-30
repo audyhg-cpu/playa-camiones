@@ -195,7 +195,13 @@ export default {
         if(!r.meta.changes)return J({error:q?'Ese lugar ya fue ocupado por otro operador. La pantalla fue actualizada.':'Ese lugar ya estaba libre'},409);
         if(q)await D.prepare('UPDATE filas SET producto_vence_en=NULL WHERE fila=?').bind(f).run();
         await D.prepare('INSERT INTO movimientos(fila,posicion,accion,operador) VALUES(?,?,?,?)').bind(f,p,q?'OCUPAR':'LIBERAR',o).run();
-        return J({ok:true,message:'Fila '+f+' · lugar '+p+' '+(q?'ocupado':'libre')});
+        if (!q) {
+          const compactar = filaActual?.sentido === 'izquierda'
+            ? "WITH total AS (SELECT COUNT(*) n FROM lugares WHERE fila=? AND ocupado=1), orden AS (SELECT posicion, ROW_NUMBER() OVER (ORDER BY posicion DESC) rn FROM lugares WHERE fila=? AND bloqueado=0) UPDATE lugares SET ocupado=CASE WHEN posicion IN (SELECT posicion FROM orden,total WHERE rn<=n) THEN 1 ELSE 0 END WHERE fila=?"
+            : "WITH total AS (SELECT COUNT(*) n FROM lugares WHERE fila=? AND ocupado=1), orden AS (SELECT posicion, ROW_NUMBER() OVER (ORDER BY posicion ASC) rn FROM lugares WHERE fila=? AND bloqueado=0) UPDATE lugares SET ocupado=CASE WHEN posicion IN (SELECT posicion FROM orden,total WHERE rn<=n) THEN 1 ELSE 0 END WHERE fila=?";
+          await D.prepare(compactar).bind(f,f,f).run();
+        }
+        return J({ok:true,message:q?'Fila '+f+' · lugar '+p+' ocupado':'Fila '+f+' · lugar liberado · posiciones reacomodadas'});
       }
 
       if (u.pathname === '/api/corte' && req.method === 'POST') {
