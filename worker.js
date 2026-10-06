@@ -24,7 +24,7 @@ async function init(env) {
       D.prepare("CREATE TABLE IF NOT EXISTS filas(fila INTEGER PRIMARY KEY,sector TEXT NOT NULL,producto TEXT NOT NULL DEFAULT 'Soja',sentido TEXT NOT NULL DEFAULT 'derecha')"),
       D.prepare("CREATE TABLE IF NOT EXISTS lugares(fila INTEGER NOT NULL,posicion INTEGER NOT NULL,ocupado INTEGER NOT NULL DEFAULT 0,operador TEXT,PRIMARY KEY(fila,posicion))"),
       D.prepare("CREATE TABLE IF NOT EXISTS movimientos(id INTEGER PRIMARY KEY AUTOINCREMENT,fila INTEGER NOT NULL,posicion INTEGER,accion TEXT NOT NULL,operador TEXT,creado_en TEXT DEFAULT CURRENT_TIMESTAMP)"),
-      D.prepare("CREATE TABLE IF NOT EXISTS sync_meta(id INTEGER PRIMARY KEY,version INTEGER NOT NULL DEFAULT 1)")
+      D.prepare("CREATE TABLE IF NOT EXISTS sync_meta(id INTEGER PRIMARY KEY,version INTEGER NOT NULL DEFAULT 1,next_expire INTEGER)")
     ]);
 
     const cols = await D.prepare('PRAGMA table_info(lugares)').all();
@@ -40,8 +40,14 @@ async function init(env) {
       await D.prepare('ALTER TABLE filas ADD COLUMN activada_en INTEGER').run();
     }
 
+    const syncCols = await D.prepare('PRAGMA table_info(sync_meta)').all();
+    if (!syncCols.results.some(c => c.name === 'next_expire')) {
+      await D.prepare('ALTER TABLE sync_meta ADD COLUMN next_expire INTEGER').run();
+    }
+
     await D.prepare('INSERT OR IGNORE INTO sync_meta(id,version) VALUES(1,1)').run();
     await D.prepare('CREATE INDEX IF NOT EXISTS idx_filas_producto_vence_en ON filas(producto_vence_en)').run();
+    await D.prepare("UPDATE sync_meta SET next_expire=(SELECT MIN(producto_vence_en) FROM filas WHERE producto_vence_en IS NOT NULL AND sector='post' AND producto<>'Vacío' AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1)) WHERE id=1").run();
 
     for (const p of ['Vacío','Soja','Maíz','Girasol','Trigo','Camelina']) {
       await D.prepare('INSERT OR IGNORE INTO productos(nombre) VALUES(?)').bind(p).run();
@@ -76,9 +82,14 @@ async function currentVersion(D) {
   return Number(v?.version || 1);
 }
 
+async function refreshNextExpire(D) {
+  await D.prepare("UPDATE sync_meta SET next_expire=(SELECT MIN(producto_vence_en) FROM filas WHERE producto_vence_en IS NOT NULL AND sector='post' AND producto<>'Vacío' AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1)) WHERE id=1").run();
+}
+
 async function expireStale(D) {
   const r = await D.prepare("UPDATE filas SET producto='Vacío', producto_vence_en=NULL, activada_en=NULL WHERE producto_vence_en IS NOT NULL AND producto_vence_en<=unixepoch() AND sector='post' AND producto<>'Vacío' AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1)").run();
   if (r.meta.changes) await bump(D);
+  await refreshNextExpire(D);
 }
 
 async function state(D) {
@@ -188,8 +199,12 @@ export default {
       if (req.method === 'POST' && ['/api/fila','/api/producto','/api/lugar','/api/llenar','/api/corte','/api/vaciar'].includes(u.pathname) && !operador) return J({error:'Ingresá tu nombre de operador para continuar'},400);
 
       if (u.pathname === '/api/version' && req.method === 'GET') {
-        await expireStale(D);
-        return J({version:await currentVersion(D)});
+        const meta = await D.prepare('SELECT version,next_expire FROM sync_meta WHERE id=1').first();
+        if (meta?.next_expire && Number(meta.next_expire) <= Math.floor(Date.now()/1000)) {
+          await expireStale(D);
+          return J({version:await currentVersion(D)});
+        }
+        return J({version:Number(meta?.version || 1)});
       }
 
       if (u.pathname === '/api/state' && req.method === 'GET') return J(await state(D));
@@ -200,6 +215,7 @@ export default {
         if (b.producto !== undefined) {
           const producto=String(b.producto);
           await D.prepare("UPDATE filas SET producto=?, producto_vence_en=CASE WHEN sector='post' AND ?<>'Vacío' AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1) THEN unixepoch()+600 ELSE NULL END, activada_en=CASE WHEN sector='post' AND ?<>'Vacío' THEN unixepoch() ELSE NULL END WHERE fila=?").bind(producto,producto,producto,f).run();
+          await refreshNextExpire(D);
           changed=true;
         }
         if (b.sentido !== undefined) {
@@ -237,7 +253,7 @@ export default {
         }
         const r=await D.prepare('UPDATE lugares SET ocupado=?,operador=CASE WHEN ?=1 THEN ? ELSE NULL END WHERE fila=? AND posicion=? AND ocupado=?').bind(q,q,o,f,p,old).run();
         if(!r.meta.changes)return J({error:q?'Ese lugar ya fue ocupado por otro operador. La pantalla fue actualizada.':'Ese lugar ya estaba libre'},409);
-        if(q)await D.prepare('UPDATE filas SET producto_vence_en=NULL WHERE fila=?').bind(f).run();
+        if(q){await D.prepare('UPDATE filas SET producto_vence_en=NULL WHERE fila=?').bind(f).run();await refreshNextExpire(D)}
         await D.prepare('INSERT INTO movimientos(fila,posicion,accion,operador) VALUES(?,?,?,?)').bind(f,p,q?'OCUPAR':'LIBERAR',o).run();
         if (!q) {
           const max=f<=14?12:5;
@@ -285,6 +301,7 @@ export default {
         const c=await D.prepare('SELECT COUNT(*) c FROM lugares WHERE fila=? AND ocupado=1').bind(f).first();
         await D.prepare('UPDATE lugares SET ocupado=0,operador=NULL WHERE fila=?').bind(f).run();
         await D.prepare("UPDATE filas SET producto='Vacío',producto_vence_en=NULL,activada_en=NULL WHERE fila=?").bind(f).run();
+        await refreshNextExpire(D);
         await bump(D);
         if(!c?.c)return J({ok:true,message:'Fila '+f+' marcada como vacía'});
         await D.prepare("INSERT INTO movimientos(fila,posicion,accion,operador) VALUES(?,NULL,'VACIAR_FILA',?)").bind(f,o).run();
