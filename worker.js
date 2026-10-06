@@ -23,7 +23,8 @@ async function init(env) {
       D.prepare("CREATE TABLE IF NOT EXISTS productos(id INTEGER PRIMARY KEY AUTOINCREMENT,nombre TEXT NOT NULL UNIQUE)"),
       D.prepare("CREATE TABLE IF NOT EXISTS filas(fila INTEGER PRIMARY KEY,sector TEXT NOT NULL,producto TEXT NOT NULL DEFAULT 'Soja',sentido TEXT NOT NULL DEFAULT 'derecha')"),
       D.prepare("CREATE TABLE IF NOT EXISTS lugares(fila INTEGER NOT NULL,posicion INTEGER NOT NULL,ocupado INTEGER NOT NULL DEFAULT 0,operador TEXT,PRIMARY KEY(fila,posicion))"),
-      D.prepare("CREATE TABLE IF NOT EXISTS movimientos(id INTEGER PRIMARY KEY AUTOINCREMENT,fila INTEGER NOT NULL,posicion INTEGER,accion TEXT NOT NULL,operador TEXT,creado_en TEXT DEFAULT CURRENT_TIMESTAMP)")
+      D.prepare("CREATE TABLE IF NOT EXISTS movimientos(id INTEGER PRIMARY KEY AUTOINCREMENT,fila INTEGER NOT NULL,posicion INTEGER,accion TEXT NOT NULL,operador TEXT,creado_en TEXT DEFAULT CURRENT_TIMESTAMP)"),
+      D.prepare("CREATE TABLE IF NOT EXISTS sync_meta(id INTEGER PRIMARY KEY,version INTEGER NOT NULL DEFAULT 1)")
     ]);
 
     const cols = await D.prepare('PRAGMA table_info(lugares)').all();
@@ -39,6 +40,9 @@ async function init(env) {
       await D.prepare('ALTER TABLE filas ADD COLUMN activada_en INTEGER').run();
     }
 
+    await D.prepare('INSERT OR IGNORE INTO sync_meta(id,version) VALUES(1,1)').run();
+    await D.prepare('CREATE INDEX IF NOT EXISTS idx_filas_producto_vence_en ON filas(producto_vence_en)').run();
+
     for (const p of ['Vacío','Soja','Maíz','Girasol','Trigo','Camelina']) {
       await D.prepare('INSERT OR IGNORE INTO productos(nombre) VALUES(?)').bind(p).run();
     }
@@ -46,7 +50,7 @@ async function init(env) {
     for (let f = 1; f <= 14; f++) {
       const sector = f <= 12 ? 'pre' : 'demorado';
       await D.prepare('INSERT OR IGNORE INTO filas(fila,sector) VALUES(?,?)').bind(f,sector).run();
-      if (f >= 13) await D.prepare("UPDATE filas SET sector='demorado' WHERE fila=?").bind(f).run();
+      if (f >= 13) await D.prepare("UPDATE filas SET sector='demorado' WHERE fila=? AND sector<>'demorado'").bind(f).run();
       for (let p = 1; p <= 12; p++) {
         await D.prepare('INSERT OR IGNORE INTO lugares(fila,posicion) VALUES(?,?)').bind(f,p).run();
       }
@@ -63,8 +67,23 @@ async function init(env) {
   return boot;
 }
 
+async function bump(D) {
+  await D.prepare('UPDATE sync_meta SET version=version+1 WHERE id=1').run();
+}
+
+async function currentVersion(D) {
+  const v = await D.prepare('SELECT version FROM sync_meta WHERE id=1').first();
+  return Number(v?.version || 1);
+}
+
+async function expireStale(D) {
+  const r = await D.prepare("UPDATE filas SET producto='Vacío', producto_vence_en=NULL, activada_en=NULL WHERE producto_vence_en IS NOT NULL AND producto_vence_en<=unixepoch() AND sector='post' AND producto<>'Vacío' AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1)").run();
+  if (r.meta.changes) await bump(D);
+}
+
 async function state(D) {
-  await D.prepare("UPDATE filas SET producto='Vacío', producto_vence_en=NULL, activada_en=NULL WHERE sector='post' AND producto<>'Vacío' AND producto_vence_en IS NOT NULL AND producto_vence_en<=unixepoch() AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1)").run();
+  await expireStale(D);
+  const version = await currentVersion(D);
   const [p, f, l] = await Promise.all([
     D.prepare("SELECT nombre FROM productos ORDER BY CASE WHEN nombre='Vacío' THEN 0 ELSE 1 END, nombre COLLATE NOCASE").all(),
     D.prepare('SELECT fila,sector,producto,sentido,activada_en FROM filas ORDER BY fila').all(),
@@ -85,7 +104,8 @@ async function state(D) {
   return {
     productos: p.results.map(x => x.nombre),
     filas: F,
-    lugares: L
+    lugares: L,
+    version
   };
 }
 
@@ -121,7 +141,7 @@ const H = `<!doctype html>
 <dialog id="dlg"><form id="form"><b>Agregar producto</b><br><input id="np" required maxlength="30" placeholder="Ej.: Sorgo"><button>Guardar</button><button type="button" id="can">Cancelar</button></form></dialog>
 </div>
 <script>
-const $=x=>document.getElementById(x),S={productos:[],filas:{},lugares:{}};let tab='pre',busy=false,tm,pauseUntil=0,noticeResolve=null;
+const $=x=>document.getElementById(x),S={productos:[],filas:{},lugares:{}};let tab='pre',busy=false,tm,pauseUntil=0,noticeResolve=null,lastVersion=0;
 const savedOp=(localStorage.op||'').trim();$('op').value=savedOp;const who=()=>($('op').value||'').trim();function showOpGate(){const actual=who();$('opname').value=actual;$('opgate').classList.remove('hide');setTimeout(()=>$('opname').focus(),50)}function saveOperator(){const n=($('opname').value||'').trim().slice(0,40);if(!n){$('opname').focus();return}$('op').value=n;localStorage.op=n;$('opgate').classList.add('hide');if(Object.keys(S.filas).length)render()}$('opsave').onclick=saveOperator;$('opname').onkeydown=e=>{if(e.key==='Enter')saveOperator()};$('op').oninput=()=>{localStorage.op=who()};$('op').onfocus=()=>pauseUntil=Date.now()+30000;$('op').onblur=()=>{pauseUntil=0;if(!who())showOpGate();else{localStorage.op=who();if(Object.keys(S.filas).length)render()}setTimeout(()=>load(),300)};if(!savedOp)setTimeout(showOpGate,0);
 function initials(n){const a=String(n||'').trim().split(' ').filter(Boolean);if(!a.length)return '●';return (a[0][0]+(a.length>1?a[a.length-1][0]:(a[0][1]||''))).toUpperCase()}
 function toast(m){clearTimeout(tm);$('t').textContent=m;$('t').classList.add('on');tm=setTimeout(()=>$('t').classList.remove('on'),1600)}
@@ -142,8 +162,9 @@ async function slot(f,p,on,bl,opx=''){if(bl&&!on)return;if(!who())return showOpG
 async function corte(f,reabrir){try{const j=await api('/api/corte',{method:'POST',body:JSON.stringify({fila:f,reabrir,operador:who()})});toast(reabrir?j.message:'CORTE — CAMBIAR DE FILA');if(!reabrir)notice('Fila '+f+' cortada. Continuar en la siguiente fila disponible.','CORTE — CAMBIAR DE FILA');load()}catch(e){notice(e.message)}}
 async function fillRow(f){if(!who())return showOpGate();if(!S.filas[f]?.producto||S.filas[f].producto==='Vacío')return notice('Primero seleccioná un producto');let c=0;for(let p=1;p<=12;p++)if(S.lugares[f]?.[p]?.ocupado)c++;if(c===12)return toast('Fila '+f+' ya está llena');const ok=await askNotice('Se marcarán ocupados los 12 lugares de la fila '+f+'.','¿LLENAR FILA?','Llenar');if(!ok)return;try{const j=await api('/api/llenar',{method:'POST',body:JSON.stringify({fila:f,operador:who()})});toast(j.message);load()}catch(e){notice(e.message)}}
 async function clearRow(f){if(!who())return showOpGate();const max=f<=14?12:5;let c=0;for(let p=1;p<=max;p++)if(S.lugares[f]?.[p]?.ocupado)c++;if(c){const ok=await askNotice('Se liberarán '+c+' '+(c===1?'camión':'camiones')+' de la fila '+f+'.','¿VACIAR FILA?','Vaciar');if(!ok)return}try{const j=await api('/api/vaciar',{method:'POST',body:JSON.stringify({fila:f,operador:who()})});toast(j.message);load()}catch(e){notice(e.message)}}
-async function load(){if(busy||Date.now()<pauseUntil)return;busy=true;try{const d=await api('/api/state');Object.assign(S,d);render();$('st').textContent='Sincronizado · actualiza cada 2 s'}catch(e){$('st').textContent=e.message}finally{busy=false}}
-$('ref').onclick=()=>{pauseUntil=0;load()};$('add').onclick=()=>$('dlg').showModal();$('can').onclick=()=>$('dlg').close();$('form').onsubmit=async e=>{e.preventDefault();try{await api('/api/producto',{method:'POST',body:JSON.stringify({nombre:$('np').value.trim(),operador:who()})});$('dlg').close();$('np').value='';load()}catch(x){notice(x.message)}};load();setInterval(()=>{if(!document.hidden&&Date.now()>=pauseUntil)load()},2000);
+async function load(force=false){if(busy||(!force&&Date.now()<pauseUntil))return;busy=true;try{const d=await api('/api/state');Object.assign(S,d);lastVersion=Number(d.version||lastVersion||0);render();$('st').textContent='Sincronizado · verifica cambios cada 10 s'}catch(e){$('st').textContent=e.message}finally{busy=false}}
+async function checkChanges(){if(busy||Date.now()<pauseUntil||document.hidden)return;try{const v=await api('/api/version');const n=Number(v.version||0);if(n!==lastVersion)await load(true);else $('st').textContent='Sincronizado · sin cambios'}catch(e){$('st').textContent=e.message}}
+$('ref').onclick=()=>{pauseUntil=0;load(true)};$('add').onclick=()=>$('dlg').showModal();$('can').onclick=()=>$('dlg').close();$('form').onsubmit=async e=>{e.preventDefault();try{await api('/api/producto',{method:'POST',body:JSON.stringify({nombre:$('np').value.trim(),operador:who()})});$('dlg').close();$('np').value='';load(true)}catch(x){notice(x.message)}};load(true);setInterval(checkChanges,10000);
 let installEvent;window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installEvent=e;$('install').classList.remove('hide')});$('install').onclick=async()=>{if(!installEvent)return;installEvent.prompt();await installEvent.userChoice;installEvent=null;$('install').classList.add('hide')};window.addEventListener('appinstalled',()=>$('install').classList.add('hide'));if('serviceWorker'in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js'));
 </script>
 </body>
@@ -166,15 +187,26 @@ export default {
       const operador = String(b.operador||'').trim().slice(0,40);
       if (req.method === 'POST' && ['/api/fila','/api/producto','/api/lugar','/api/llenar','/api/corte','/api/vaciar'].includes(u.pathname) && !operador) return J({error:'Ingresá tu nombre de operador para continuar'},400);
 
+      if (u.pathname === '/api/version' && req.method === 'GET') {
+        await expireStale(D);
+        return J({version:await currentVersion(D)});
+      }
+
       if (u.pathname === '/api/state' && req.method === 'GET') return J(await state(D));
 
       if (u.pathname === '/api/fila' && req.method === 'POST') {
         const f = +b.fila;
+        let changed=false;
         if (b.producto !== undefined) {
           const producto=String(b.producto);
           await D.prepare("UPDATE filas SET producto=?, producto_vence_en=CASE WHEN sector='post' AND ?<>'Vacío' AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1) THEN unixepoch()+600 ELSE NULL END, activada_en=CASE WHEN sector='post' AND ?<>'Vacío' THEN unixepoch() ELSE NULL END WHERE fila=?").bind(producto,producto,producto,f).run();
+          changed=true;
         }
-        if (b.sentido !== undefined) await D.prepare('UPDATE filas SET sentido=? WHERE fila=?').bind(String(b.sentido),f).run();
+        if (b.sentido !== undefined) {
+          await D.prepare('UPDATE filas SET sentido=? WHERE fila=?').bind(String(b.sentido),f).run();
+          changed=true;
+        }
+        if(changed)await bump(D);
         return J({ok:true});
       }
 
@@ -183,6 +215,7 @@ export default {
         if (!n) return J({error:'Escribí un producto'},400);
         try {
           await D.prepare('INSERT INTO productos(nombre) VALUES(?)').bind(n).run();
+          await bump(D);
           return J({ok:true});
         } catch {
           return J({error:'Ese producto ya existe'},409);
@@ -214,6 +247,7 @@ export default {
           const cambios = destinos.results.map((d,i)=>D.prepare('UPDATE lugares SET ocupado=?,operador=? WHERE fila=? AND posicion=?').bind(i<restantes.results.length?1:0,i<restantes.results.length?(restantes.results[i].operador||''):null,f,d.posicion));
           if(cambios.length)await D.batch(cambios);
         }
+        await bump(D);
         return J({ok:true,message:q?'Fila '+f+' · lugar '+p+' ocupado':'Fila '+f+' · lugar liberado · posiciones reacomodadas'});
       }
 
@@ -225,6 +259,7 @@ export default {
         if (!filaActual.producto || filaActual.producto==='Vacío') return J({error:'Primero seleccioná un producto'},409);
         await D.prepare('UPDATE lugares SET ocupado=1,bloqueado=0,operador=? WHERE fila=? AND posicion BETWEEN 1 AND 12').bind(o,f).run();
         await D.prepare("INSERT INTO movimientos(fila,posicion,accion,operador) VALUES(?,NULL,'LLENAR_FILA_12',?)").bind(f,o).run();
+        await bump(D);
         return J({ok:true,message:'Fila '+f+' llena · 12/12 camiones'});
       }
 
@@ -234,12 +269,14 @@ export default {
         if (reabrir) {
           await D.prepare('UPDATE lugares SET bloqueado=0 WHERE fila=?').bind(f).run();
           await D.prepare("INSERT INTO movimientos(fila,posicion,accion,operador) VALUES(?,NULL,'REABRIR_FILA',?)").bind(f,o).run();
+          await bump(D);
           return J({ok:true,message:'Fila '+f+' reabierta'});
         }
         const libres = await D.prepare('SELECT COUNT(*) c FROM lugares WHERE fila=? AND ocupado=0 AND bloqueado=0').bind(f).first();
         if (!libres?.c) return J({error:'No hay lugares libres para bloquear'},409);
         await D.prepare('UPDATE lugares SET bloqueado=1 WHERE fila=? AND ocupado=0').bind(f).run();
         await D.prepare("INSERT INTO movimientos(fila,posicion,accion,operador) VALUES(?,NULL,'CORTE_FILA',?)").bind(f,o).run();
+        await bump(D);
         return J({ok:true,message:'Fila '+f+' cortada · continuar en la siguiente disponible'});
       }
 
@@ -248,6 +285,7 @@ export default {
         const c=await D.prepare('SELECT COUNT(*) c FROM lugares WHERE fila=? AND ocupado=1').bind(f).first();
         await D.prepare('UPDATE lugares SET ocupado=0,operador=NULL WHERE fila=?').bind(f).run();
         await D.prepare("UPDATE filas SET producto='Vacío',producto_vence_en=NULL,activada_en=NULL WHERE fila=?").bind(f).run();
+        await bump(D);
         if(!c?.c)return J({ok:true,message:'Fila '+f+' marcada como vacía'});
         await D.prepare("INSERT INTO movimientos(fila,posicion,accion,operador) VALUES(?,NULL,'VACIAR_FILA',?)").bind(f,o).run();
         return J({ok:true,message:'Fila '+f+' vaciada'});
