@@ -1,3 +1,5 @@
+// Playa Camiones · parche conexión 2026-10-20
+// Base recuperada: worker_sync_4s_standby_30m.zip.
 let boot;
 
 const db = env => env.DB || env.db;
@@ -49,26 +51,32 @@ async function init(env) {
     await D.prepare('CREATE INDEX IF NOT EXISTS idx_filas_producto_vence_en ON filas(producto_vence_en)').run();
     await D.prepare("UPDATE sync_meta SET next_expire=(SELECT MIN(producto_vence_en) FROM filas WHERE producto_vence_en IS NOT NULL AND sector='post' AND producto<>'Vacío' AND NOT EXISTS (SELECT 1 FROM lugares WHERE lugares.fila=filas.fila AND lugares.ocupado=1)) WHERE id=1").run();
 
+    const seeds = [];
     for (const p of ['Vacío','Soja','Maíz','Girasol','Trigo','Camelina']) {
-      await D.prepare('INSERT OR IGNORE INTO productos(nombre) VALUES(?)').bind(p).run();
+      seeds.push(D.prepare('INSERT OR IGNORE INTO productos(nombre) VALUES(?)').bind(p));
     }
 
     for (let f = 1; f <= 14; f++) {
       const sector = f <= 12 ? 'pre' : 'demorado';
-      await D.prepare('INSERT OR IGNORE INTO filas(fila,sector) VALUES(?,?)').bind(f,sector).run();
-      if (f >= 13) await D.prepare("UPDATE filas SET sector='demorado' WHERE fila=? AND sector<>'demorado'").bind(f).run();
+      seeds.push(D.prepare('INSERT OR IGNORE INTO filas(fila,sector) VALUES(?,?)').bind(f,sector));
+      if (f >= 13) seeds.push(D.prepare("UPDATE filas SET sector='demorado' WHERE fila=? AND sector<>'demorado'").bind(f));
       for (let p = 1; p <= 12; p++) {
-        await D.prepare('INSERT OR IGNORE INTO lugares(fila,posicion) VALUES(?,?)').bind(f,p).run();
+        seeds.push(D.prepare('INSERT OR IGNORE INTO lugares(fila,posicion) VALUES(?,?)').bind(f,p));
       }
     }
 
     for (let f = 16; f <= 32; f++) {
-      await D.prepare("INSERT OR IGNORE INTO filas(fila,sector) VALUES(?,'post')").bind(f).run();
+      seeds.push(D.prepare("INSERT OR IGNORE INTO filas(fila,sector) VALUES(?,'post')").bind(f));
       for (let p = 1; p <= 5; p++) {
-        await D.prepare('INSERT OR IGNORE INTO lugares(fila,posicion) VALUES(?,?)').bind(f,p).run();
+        seeds.push(D.prepare('INSERT OR IGNORE INTO lugares(fila,posicion) VALUES(?,?)').bind(f,p));
       }
     }
-  })();
+    // Mismas sentencias y orden; menos viajes a D1 durante el arranque.
+    for (let i = 0; i < seeds.length; i += 50) await D.batch(seeds.slice(i, i + 50));
+  })().catch(error => {
+    boot = undefined;
+    throw error;
+  });
 
   return boot;
 }
@@ -152,7 +160,7 @@ const H = `<!doctype html>
 <dialog id="dlg"><form id="form"><b>Agregar producto</b><br><input id="np" required maxlength="30" placeholder="Ej.: Sorgo"><button>Guardar</button><button type="button" id="can">Cancelar</button></form></dialog>
 </div>
 <script>
-const $=x=>document.getElementById(x),S={productos:[],filas:{},lugares:{}};let tab='pre',busy=false,tm,pauseUntil=0,noticeResolve=null,lastVersion=0,lastActivity=Date.now(),standby=false,wakeTimer=0;const SYNC_MS=4000,STANDBY_MS=30*60*1000;
+const $=x=>document.getElementById(x),S={productos:[],filas:{},lugares:{}};let tab='pre',busy=false,tm,pauseUntil=0,noticeResolve=null,lastVersion=0,lastActivity=Date.now(),standby=false,wakeTimer=0;const SYNC_MS=4000,STANDBY_MS=30*60*1000,REQUEST_TIMEOUT_MS=12000;let needsState=true,versionBusy=false;
 const savedOp=(localStorage.op||'').trim();$('op').value=savedOp;const who=()=>($('op').value||'').trim();function showOpGate(){const actual=who();$('opname').value=actual;$('opgate').classList.remove('hide');setTimeout(()=>$('opname').focus(),50)}function saveOperator(){const n=($('opname').value||'').trim().slice(0,40);if(!n){$('opname').focus();return}$('op').value=n;localStorage.op=n;$('opgate').classList.add('hide');if(Object.keys(S.filas).length)render()}$('opsave').onclick=saveOperator;$('opname').onkeydown=e=>{if(e.key==='Enter')saveOperator()};$('op').oninput=()=>{localStorage.op=who()};$('op').onfocus=()=>pauseUntil=Date.now()+30000;$('op').onblur=()=>{pauseUntil=0;if(!who())showOpGate();else{localStorage.op=who();if(Object.keys(S.filas).length)render()}setTimeout(()=>load(),300)};if(!savedOp)setTimeout(showOpGate,0);
 function noteActivity(){const wasStandby=standby;lastActivity=Date.now();if(wasStandby){standby=false;pauseUntil=0;clearTimeout(wakeTimer);wakeTimer=setTimeout(()=>{if(!document.hidden)load(true)},50)}}
 function checkStandby(){if(!standby&&Date.now()-lastActivity>=STANDBY_MS){standby=true;$('st').textContent='Stand-by · sin consultas'}return standby}
@@ -164,7 +172,24 @@ function closeNotice(value=false){$('notice').classList.add('hide');const r=noti
 function notice(m,title){$('noticeTitle').textContent=title||((m.includes('ya fue ocupado'))?'LUGAR YA OCUPADO':(m.includes('Próximo lugar')?'ORDEN INCORRECTO':'ATENCIÓN'));$('noticeMsg').textContent=m;$('noticeActions').classList.add('single');$('noticeOk').textContent='Aceptar';$('notice').classList.remove('hide');noticeResolve=null}
 function askNotice(m,title='CONFIRMAR',okText='Confirmar'){return new Promise(resolve=>{$('noticeTitle').textContent=title;$('noticeMsg').textContent=m;$('noticeActions').classList.remove('single');$('noticeOk').textContent=okText;$('notice').classList.remove('hide');noticeResolve=resolve})}
 $('noticeOk').onclick=()=>closeNotice(true);$('noticeCancel').onclick=()=>closeNotice(false);$('notice').onclick=e=>{if(e.target===$('notice'))closeNotice(false)};
-async function api(u,o={}){if(String(o.method||'GET').toUpperCase()==='POST'&&!who()){showOpGate();throw Error('Ingresá tu nombre de operador para continuar')}const r=await fetch(u,{headers:{'content-type':'application/json'},...o}),j=await r.json();if(!r.ok)throw Error(j.error||'Error');return j}
+async function api(u,o={}){
+  const writing=String(o.method||'GET').toUpperCase()!=='GET';
+  if(writing&&!who()){showOpGate();throw Error('Ingresá tu nombre de operador para continuar')}
+  const controller=new AbortController();let expired=false,timer;
+  const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>{expired=true;controller.abort();reject(Error(writing?'No se confirmó la operación. Actualizá y verificá el resultado antes de repetirla.':'La consulta tardó demasiado. Reintentando…'))},REQUEST_TIMEOUT_MS)});
+  try{
+    return await Promise.race([(async()=>{
+      const r=await fetch(u,{...o,headers:{'content-type':'application/json',...(o.headers||{})},cache:'no-store',signal:controller.signal});
+      let j;try{j=await r.json()}catch(e){if(expired)throw e;throw Error('Respuesta no válida del servidor. Reintentando…')}
+      if(!r.ok)throw Error(j.error||('Error del servidor ('+r.status+')'));
+      return j;
+    })(),timeout]);
+  }catch(e){
+    if(expired)throw Error(writing?'No se confirmó la operación. Actualizá y verificá el resultado antes de repetirla.':'La consulta tardó demasiado. Reintentando…');
+    if(e instanceof TypeError)throw Error(writing?'No se confirmó la operación. Actualizá y verificá el resultado antes de repetirla.':'No se pudo conectar. Reintentando…');
+    throw e;
+  }finally{clearTimeout(timer)}
+}
 function tabs(x){tab=x;const p=x==='pre';$('pre').classList.toggle('hide',!p);$('post').classList.toggle('hide',p);$('tp').classList.toggle('on',p);$('to').classList.toggle('on',!p);$('cnt').classList.toggle('hide',p);$('guide').classList.toggle('hide',p);$('sub').textContent=p?'Pre calado · Filas 1–12 · Demorados 13–14':'Pos calado · Filas 16–32'}
 $('tp').onclick=()=>tabs('pre');$('to').onclick=()=>tabs('post');
 function opts(v){return S.productos.map(x=>'<option '+(x===v?'selected':'')+'>'+x+'</option>').join('')}
@@ -177,8 +202,34 @@ async function slot(f,p,on,bl,opx=''){if(bl&&!on)return;if(!who())return showOpG
 async function corte(f,reabrir){try{const j=await api('/api/corte',{method:'POST',body:JSON.stringify({fila:f,reabrir,operador:who()})});toast(reabrir?j.message:'CORTE — CAMBIAR DE FILA');if(!reabrir)notice('Fila '+f+' cortada. Continuar en la siguiente fila disponible.','CORTE — CAMBIAR DE FILA');load()}catch(e){notice(e.message)}}
 async function fillRow(f){if(!who())return showOpGate();if(!S.filas[f]?.producto||S.filas[f].producto==='Vacío')return notice('Primero seleccioná un producto');let c=0;for(let p=1;p<=12;p++)if(S.lugares[f]?.[p]?.ocupado)c++;if(c===12)return toast('Fila '+f+' ya está llena');const ok=await askNotice('Se marcarán ocupados los 12 lugares de la fila '+f+'.','¿LLENAR FILA?','Llenar');if(!ok)return;try{const j=await api('/api/llenar',{method:'POST',body:JSON.stringify({fila:f,operador:who()})});toast(j.message);load()}catch(e){notice(e.message)}}
 async function clearRow(f){if(!who())return showOpGate();const max=f<=14?12:5;let c=0;for(let p=1;p<=max;p++)if(S.lugares[f]?.[p]?.ocupado)c++;if(c){const ok=await askNotice('Se liberarán '+c+' '+(c===1?'camión':'camiones')+' de la fila '+f+'.','¿VACIAR FILA?','Vaciar');if(!ok)return}try{const j=await api('/api/vaciar',{method:'POST',body:JSON.stringify({fila:f,operador:who()})});toast(j.message);load()}catch(e){notice(e.message)}}
-async function load(force=false){if(busy||(!force&&Date.now()<pauseUntil))return;busy=true;try{const d=await api('/api/state');Object.assign(S,d);lastVersion=Number(d.version||lastVersion||0);render();$('st').textContent='Sincronizado · verifica cambios cada 4 s'}catch(e){$('st').textContent=e.message}finally{busy=false}}
-async function checkChanges(){if(busy||Date.now()<pauseUntil||document.hidden||checkStandby())return;try{const v=await api('/api/version');const n=Number(v.version||0);if(n!==lastVersion)await load(true);else $('st').textContent='Sincronizado · sin cambios'}catch(e){$('st').textContent=e.message}}
+function validState(d){return d&&Array.isArray(d.productos)&&d.filas&&typeof d.filas==='object'&&!Array.isArray(d.filas)&&d.lugares&&typeof d.lugares==='object'&&!Array.isArray(d.lugares)&&Number.isFinite(Number(d.version))&&Number(d.version)>0&&Object.keys(d.filas).length>0}
+async function load(force=false){
+  if(busy||(!force&&Date.now()<pauseUntil))return;
+  if(navigator.onLine===false){needsState=true;$('st').textContent='Sin conexión · esperando red';return}
+  busy=true;$('st').textContent='Cargando datos…';
+  try{
+    const d=await api('/api/state');
+    if(!validState(d))throw Error('Datos incompletos del servidor. Reintentando…');
+    Object.assign(S,d);render();lastVersion=Number(d.version);needsState=false;
+    $('st').textContent='Sincronizado · verifica cambios cada 4 s';
+  }catch(e){needsState=true;$('st').textContent=e.message}
+  finally{busy=false}
+}
+async function checkChanges(){
+  if(busy||versionBusy||Date.now()<pauseUntil||document.hidden||checkStandby())return;
+  if(navigator.onLine===false){needsState=true;$('st').textContent='Sin conexión · esperando red';return}
+  versionBusy=true;
+  try{
+    if(needsState){await load(true);return}
+    const v=await api('/api/version'),n=Number(v.version);
+    if(!Number.isFinite(n)||n<=0)throw Error('Versión no válida del servidor. Reintentando…');
+    if(n!==lastVersion)await load(true);
+    else if(!busy&&!needsState)$('st').textContent='Sincronizado · sin cambios';
+  }catch(e){needsState=true;$('st').textContent=e.message}
+  finally{versionBusy=false}
+}
+window.addEventListener('online',()=>{needsState=true;pauseUntil=0;lastActivity=Date.now();standby=false;if(!document.hidden)load(true)});
+window.addEventListener('offline',()=>{needsState=true;$('st').textContent='Sin conexión · esperando red'});
 $('ref').onclick=()=>{pauseUntil=0;load(true)};$('add').onclick=()=>$('dlg').showModal();$('can').onclick=()=>$('dlg').close();$('form').onsubmit=async e=>{e.preventDefault();try{await api('/api/producto',{method:'POST',body:JSON.stringify({nombre:$('np').value.trim(),operador:who()})});$('dlg').close();$('np').value='';load(true)}catch(x){notice(x.message)}};load(true);setInterval(checkChanges,SYNC_MS);
 let installEvent;window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();installEvent=e;$('install').classList.remove('hide')});$('install').onclick=async()=>{if(!installEvent)return;installEvent.prompt();await installEvent.userChoice;installEvent=null;$('install').classList.add('hide')};window.addEventListener('appinstalled',()=>$('install').classList.add('hide'));if('serviceWorker'in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js'));
 </script>
